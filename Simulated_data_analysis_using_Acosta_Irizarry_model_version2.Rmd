@@ -1,0 +1,1129 @@
+---
+title: "Többlethalálozás elemzés: Szimulált adatokon Acosta és Irizarry modelljének elemzése"
+author: "Varga Zoltan"
+date: "2025-11-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Könyvátark importálása
+
+```{r import packages, warning=FALSE, message=FALSE}
+# ===================================================================
+#                                  KÖNYVTÁRAK
+# ===================================================================
+# A halandósági idősorok feldolgozásához szükséges alapvető R csomagok:
+#   - dplyr: adatmanipuláció (szűrés, rendezés, mutációk, csoportosítás)
+#   - lubridate: dátumkezelés (év/hónap/hét kinyerése, dátum parse)
+#   - tidyr: long <-> wide formátum közti átalakítás
+#   - kableExtra, knitr: táblázatok igényes megjelenítésére
+#   - ggplot2: adatvizualizáció
+#   - scales: tengelyformázások (log-skála, számformázás)
+#   - excessmort: Acosta–Irizarry többlethalálozási modell
+# ===================================================================
+
+library(dplyr) 
+library(lubridate) 
+library(tidyr) 
+library(kableExtra)
+library(knitr)
+library(ggplot2)
+library(scales)
+library(excessmort)
+```
+
+# Adatelemzés
+
+### Adatok beolvasása
+```{r }
+
+# ===================================================================
+#                           ADATOK BEOLVASÁSA
+# ===================================================================
+# A korábban előállított, 23 évre szóló szimulált heti halálozási adatsor
+# betöltése. Minden oszlop egy-egy korcsoportot jelöl.
+# A date oszlop Date típusra lesz konvertálva.
+# ===================================================================
+data_original <- as.data.frame(read.csv2("df_results_23_years_version2_copied.csv",
+                                header = TRUE,
+                                check.names = FALSE,
+                                sep = ","))
+
+data_original$date <- as.Date(data_original$date)
+
+# ===================================================================
+#                   ADATOK ÁTTEKINTÉSE TÁBLÁZATBAN
+# ===================================================================
+# Kellemesen formázott, görgethető kableExtra táblázatot készítünk,
+# hogy áttekintsük az idősor szerkezetét.
+# ===================================================================
+kable(data_original,
+      caption = "Adatsor áttekintés",
+      booktabs = TRUE) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"), 
+    full_width = FALSE, 
+    position = "center" 
+  ) %>%
+  scroll_box(height = "400px") 
+
+```
+
+## Korcsoportok szerinti elemzés
+
+Az elemzés célja az, hogy a rendelkezésre álló 23 évnyi heti generált realisztikus mortalitási adatsorból korcsoportonként megbecsüljük a várható halálozást, a hosszú távú trend és szezonális ingadozások figyelembevételével. Ehhez az excessmort R csomag Acosta-Irizarry modelljént alkalmaztam.
+
+A modell bemenete minden korcsoportra külön egy idősor, amely tartalmazza:
+
+  - dátum (date)
+  - halálozási esetszám (outcome)
+  - népesség (population) - konstans 1
+  - év (year)
+
+A 23 évnyi adatból a legkorábbi 20 év szolgált a modell tanítására, míg a 21. év adatait kizártam a fitből, hogy a modell azokra független előrejelzést adjon.
+A kizárás az exclude argumentummal történik, amely megakadályozza, hogy a modell bármilyen információt felhasználjon a vizsgált évből.
+
+A weekly struktúra miatt a modellbe:
+
+  - frequency = 52
+  - weekday-effect = FALSE
+  
+beállításokat alkalmaztam, mivel heti adatok esetén a hét napjai nem változnak, így a "weekday effect" nem értelmezhető.
+
+A baseline halálozást a compute_expected() függvény határozza meg, amely spline-alapú trendet és Fourier-alapú szezonális komponenst illeszt kizárólag tanírásra használt időszakra, majd ezt kiterjeszti az előrejelzendő időszakra. 
+A függvény kimenete az alábbi:
+
+  - `expected`: várható halálozás
+  - `excluded`: logikai érték, jelzi, hogy a megfigyelés szerepelt-e a modell illesztésében (a 21. év minden napja `TRUE`)
+  - egyesített trend-szezonalitás modell által becsült baseline
+  
+Az elemzés eredménye két fő adatkeretben került elmentésre:
+
+  - `results_all`: teljes baseline minden évre, korcsoportonként
+  - `predictions_1y`: a 21. év előrejelzett baseline értékei
+  
+  
+### Korcsoportok szerinti elemzés: 20 ÉV TANÍTÁS + 1 ÉVES ELŐREJELZÉS
+
+```{r}
+#-----------------------------------------------------------
+# 1. Adathalmaz előkészítése
+#-----------------------------------------------------------
+data <- data_original
+
+
+#-----------------------------------------------------------
+# 2. Évek meghatározása
+#-----------------------------------------------------------
+years <- sort(unique(year(data$date)))
+
+baseline_years <- years[1:20]     # 20 év tanítás
+forecast_year  <- years[21]       # 1 év előrejelzés
+
+
+#-----------------------------------------------------------
+# 3. A 21. év dátumai (exclude)
+#-----------------------------------------------------------
+exclude_dates <- data %>%
+  filter(year(date) == forecast_year) %>%
+  pull(date)
+
+
+#-----------------------------------------------------------
+# 4. KORCSOPORT LISTA (oszlopnevek a date kivételével)
+#-----------------------------------------------------------
+agegroups <- colnames(data)[colnames(data) != "date"]
+
+
+#-----------------------------------------------------------
+# 5. EREDMÉNYTÁBLA LÉTREHOZÁSA
+#-----------------------------------------------------------
+results <- list()
+
+
+#-----------------------------------------------------------
+# 6. ITERÁLÁS MINDEN KORCSOPORTON
+#-----------------------------------------------------------
+for (ag in agegroups) {
+
+  message("Futtatás korcsoport: ", ag)
+  df <- data %>%
+    select(date, outcome = all_of(ag)) %>%
+    mutate(
+      population = 1,                # konstans populáció
+      year       = year(date)
+    )
+
+  # compute_expected futtatása
+  expected_df <- compute_expected(
+    counts          = df,
+    exclude         = exclude_dates,
+    frequency       = 52,           # heti adatra 52
+    weekday.effect  = FALSE,
+    keep.components = TRUE,
+    verbose         = FALSE
+  )
+
+  # Eredmény elmentése listába
+  expected_df$agegroup <- ag
+  results[[ag]] <- expected_df
+}
+
+
+#-----------------------------------------------------------
+# 7. EREDMÉNYEK ÖSSZEFŰZÉSE
+#-----------------------------------------------------------
+results_all <- bind_rows(results)
+
+
+#-----------------------------------------------------------
+# 8. 21. év előrejelzése kiszedve
+#-----------------------------------------------------------
+predictions_1y <- results_all %>%
+  filter(year == forecast_year) %>%
+  select(date, agegroup, outcome, expected, excluded) %>%
+  mutate(expected_int = round(expected))
+
+#-----------------------------------------------------------
+# A végeredmény:
+# - results_all   : minden korcsoportra az expected baseline
+# - predictions_1y: csak a 21. év előrejelzése korcsoportonként
+#-----------------------------------------------------------
+
+head(predictions_1y)
+
+kable(predictions_1y,
+      caption = "Eredményül kapott adatsor",
+      booktabs = TRUE) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  scroll_box(height = "400px")
+
+# Eredmények mentése
+results_all <- bind_rows(results)
+
+#write.csv(predictions_1y, "TEST_1_A_predictions_1year_per_agegroup.csv", row.names = FALSE)
+#write.csv(results_all,    "TEST_1_A_expected_outcome_all_years_per_agegroup.csv", row.names = FALSE)
+  
+ agegroups <- sort(unique(results_all$agegroup))
+
+  for (ag in agegroups) {
+    
+    plot_df <- results_all %>%
+      filter(agegroup == ag, year == forecast_year)
+  
+    p <- ggplot(plot_df, aes(x = date)) +
+      geom_line(aes(y = outcome), color = "#0f77b4",  linewidth = 0.3) +
+      geom_line(aes(y = expected), color = "#ff7f0e", linewidth = 1.1) +
+      labs(
+        title = paste("Observed vs expected – korcsoport:", ag),
+        x     = "Dátum",
+        y     = "Halálozási esetszám"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5)
+      )
+    
+    print(p)  
+  }
+ 
+ prediction_T_1_A <- predictions_1y
+```
+
+
+```{r}
+# ===================================================================
+#      AGGREGÁLT POPULÁCIÓS HALÁLOZÁSI IDŐSOR ELŐÁLLÍTÁSA
+# ===================================================================
+# Cél:
+#   A 21. évre előrejelzett baseline (predictions_1y) tartalmazza
+#   minden korcsoportra külön az observed és expected értékeket.
+#
+#   Ez a blokk ezeket összevonja:
+#       - outcome_total      = megfigyelt halálozás összegzése
+#       - expected_total     = modell által becsült baseline
+#       - expected_int_total = integerre kerekített baseline
+#
+#   Az eredmény egyetlen idősor, amely a teljes populációra nézve
+#   mutatja a halálozás időbeli alakulását.
+# ===================================================================
+agg_daily <- predictions_1y %>%
+  group_by(date) %>%
+  summarise(
+    outcome_total = sum(outcome, na.rm = TRUE),
+    expected_total = sum(expected, na.rm = TRUE),
+    expected_int_total = sum(expected_int, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+
+kable(agg_daily,
+      caption = "Aggregált adatsor áttekintése",
+      booktabs = TRUE) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  scroll_box(height = "400px")
+
+
+ggplot(agg_daily, aes(x = date)) +
+  geom_line(aes(y = outcome_total, color = "Observed"), linewidth = 0.6) +
+  geom_line(aes(y = expected_total, color = "Predicted"), linewidth = 1.1) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#0f77b4",
+      "Predicted" = "#ff7f0e"
+    ),
+    labels = c(
+      "Observed" = "Megfigyelt halálozás",
+      "Predicted" = "Prediktált halálozás"
+    ),
+    name = NULL
+  ) +
+  labs(
+    x = "Dátum",
+    y = "Halálozási esetszám"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+
+#write.csv(agg_daily, "TEST_1_A_aggregated_observed_expected.csv", row.names = FALSE)
+```
+
+
+### Korcsoportok szerinti elemzés: 20 ÉV TANÍTÁS + 2 ÉVES ELŐREJELZÉS
+  
+```{r}
+#-----------------------------------------------------------
+# 1. Adathalmaz előkészítése
+#-----------------------------------------------------------
+data <- data_original
+
+
+#-----------------------------------------------------------
+# 2. Évek meghatározása
+#-----------------------------------------------------------
+years <- sort(unique(year(data$date)))
+
+baseline_years <- years[1:20] # 20 év tanítás
+forecast_year <- years[21:22] # 2 év előrejelzés
+
+
+#-----------------------------------------------------------
+# 3. A 21 - 22. év dátumai
+#-----------------------------------------------------------
+exclude_dates <- data %>%
+  filter(year(date) %in% forecast_year) %>%
+  pull(date)
+
+
+#-----------------------------------------------------------
+# 4. Korcsoport lista (oszlopnevek a date kivételével)
+#-----------------------------------------------------------
+agegroups <- colnames(data)[colnames(data) != "date"]
+
+
+#-----------------------------------------------------------
+# 5. Eredménytábla létrehozása
+#-----------------------------------------------------------
+results <- list()
+
+
+#-----------------------------------------------------------
+# 6. Iterálás minden korcsoporton
+#-----------------------------------------------------------
+for (ag in agegroups) {
+  message("Futtatás korcsoport: ", ag)
+  
+  df <- data %>%
+    select(date, outcome = all_of(ag)) %>%
+    mutate(
+      population = 1,
+      year       = year(date)
+    )
+  
+  expected_df <- compute_expected(
+    counts          = df,
+    exclude         = exclude_dates,
+    frequency       = 52,
+    weekday.effect  = FALSE,
+    keep.components = TRUE,
+    verbose         = FALSE   
+  )
+  
+  expected_df$agegroup <- ag
+  results[[ag]] <- expected_df
+}
+
+
+#-----------------------------------------------------------
+# 7. Eredmények összefűzése
+#-----------------------------------------------------------
+results_all <- bind_rows(results)
+
+predictions_2y <- results_all %>%
+  filter(year %in% forecast_year) %>%
+  select(date, agegroup, outcome, expected, excluded) %>%
+  mutate(expected_int = round(expected))
+
+
+#-----------------------------------------------------------
+# 9. Eredmények megjelenítése, mentése
+#-----------------------------------------------------------
+
+kable(predictions_2y,
+      caption = "Eredményül kapott adatsor",
+      booktabs = TRUE) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  scroll_box(height = "400px")
+
+#write.csv(predictions_2y, "TEST_1_B_predictions_2year_per_agegroup.csv", row.names = FALSE)
+#write.csv(results_all, "TEST_1_B_expected_outcome_all_years_per_agegroup.csv", row.names = FALSE)
+
+agegroups <- sort(unique(results_all$agegroup))
+
+for (ag in agegroups) {
+  plot_df <- results_all %>%
+    filter(agegroup == ag, year == forecast_year)
+  
+  p <- ggplot(plot_df, aes(x = date)) +
+    geom_line(aes(y = outcome), color = "#0f77b4", linewidth = 0.3) +
+    geom_line(aes(y = expected), color = "#ff7f0e", linewidth = 1.1) +
+    labs(
+      title = paste("Observed vs expected 2 év előrejelzés - korcsoport:", ag),
+      x = "Dátum",
+      y = "Halálozási esetszám"
+    ) +
+    theme_minimal() + 
+    theme(
+      plot.title = element_text(hjust = 0.5)
+    )
+  print(p)
+}
+prediction_T_1_B <- predictions_2y 
+```
+
+
+```{r }
+# ===================================================================
+#      AGGREGÁLT POPULÁCIÓS HALÁLOZÁSI IDŐSOR ELŐÁLLÍTÁSA
+# ===================================================================
+# Cél:
+#   A 21-22 évre előrejelzett baseline (predictions_2y) tartalmazza
+#   minden korcsoportra külön az observed és expected értékeket.
+#
+#   Ez a blokk ezeket összevonja:
+#       - outcome_total      = megfigyelt halálozás összegzése
+#       - expected_total     = modell által becsült baseline
+#       - expected_int_total = integerre kerekített baseline
+#
+#   Az eredmény egyetlen idősor, amely a teljes populációra nézve
+#   mutatja a halálozás időbeli alakulását.
+# ===================================================================
+agg_daily <- predictions_2y %>%
+  group_by(date) %>%
+  summarise(
+    outcome_total = sum(outcome, na.rm = TRUE),
+    expected_total = sum(expected, na.rm = TRUE),
+    expected_int_total = sum(expected_int, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+kable(agg_daily,
+      caption = "Aggregált adatsor áttekintése",
+      booktabs = TRUE) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  scroll_box(height = "400px")
+
+ggplot(agg_daily, aes(x = date)) +
+  geom_line(aes(y = outcome_total, color = "Observed"), linewidth = 0.6) +
+  geom_line(aes(y = expected_total, color= "Predicted"), linewidth = 1.1) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#0f77b4",
+      "Predicted" = "#ff7f0e"
+    ),
+    labels = c(
+      "Observed" = "Megfigyelt halálozás",
+      "Predicted" = "Prediktált halálozás"
+    ),
+    name = NULL
+  ) +
+  labs(
+    x = "Dátum",
+    y = "Halálozási esetszám"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+
+#write.csv(agg_daily, "TEST_1_B_aggregated_observed_expected.csv", row.names = FALSE)
+```
+
+
+
+### Korcsoportok szerinti elemzés: 20 ÉV TANÍTÁS + 3 ÉVES ELŐREJELZÉS
+
+```{r}
+#-----------------------------------------------------------
+# 1. Adathalmaz előkészítése
+#-----------------------------------------------------------
+data <- data_original
+
+
+#-----------------------------------------------------------
+# 2. Évek meghatározása
+#-----------------------------------------------------------
+years <- sort(unique(year(data$date)))
+
+baseline_years <- years[1:20]
+forecast_year <- years[21:23]
+
+
+#-----------------------------------------------------------
+# 3. A 21 - 23. év dátumai
+#-----------------------------------------------------------
+exclude_dates <- data %>%
+  filter(year(date) %in% forecast_year) %>%
+  pull(date)
+
+
+#-----------------------------------------------------------
+# 4. Korcsoport lista (oszlopnevek a date kivételével)
+#-----------------------------------------------------------
+agegroups <- colnames(data)[colnames(data) != "date"]
+
+
+#-----------------------------------------------------------
+# 5. Eredménytábla létrehozása
+#-----------------------------------------------------------
+results <- list()
+
+
+#-----------------------------------------------------------
+# 6. Iterálás minden korcsoporton
+#-----------------------------------------------------------
+for (ag in agegroups) {
+  
+  message("Futtatott korcsoport: ", ag)
+  
+  df <- data %>%
+    select(date, outcome = all_of(ag)) %>%
+    mutate(
+      population = 1,
+      year = year(date)
+    )
+  
+  computed_df <- compute_expected(
+    counts          = df,
+    exclude         = exclude_dates,
+    frequency       = 52,
+    weekday.effect  = FALSE,
+    keep.components = TRUE,
+    verbose         = FALSE
+  )
+  
+  expected_df$agegroup <- ag
+  results[[ag]] <- expected_df
+}
+
+
+#-----------------------------------------------------------
+# 7. Eredmények összefűzése
+#-----------------------------------------------------------
+results_all <- bind_rows(results)
+
+
+#-----------------------------------------------------------
+# 8. A 21 - 23. évek előrejelzéseinek kiszedése
+#-----------------------------------------------------------
+predictions_3y <- results_all %>%
+  filter(year %in% forecast_year) %>%
+  select(date, agegroup, outcome, expected, excluded) %>%
+  mutate(expected_int = round(expected))
+
+
+#-----------------------------------------------------------
+# 9. Eredmények megjelenítése, mentése
+#-----------------------------------------------------------
+kable(predictions_3y,
+      caption = "Eredményül kapott adatsor",
+      vooktabs = TRUE) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  scroll_box(height = "400px")
+
+#write.csv(predictions_3y, "TEST_1_C_predictions_3year_per_agegroup.csv", row.names = FALSE)
+#write.csv(results_all, "TEST_1_C_expected_outcome_all_years_per_agegroup.csv", row.names = FALSE)
+
+
+agegroups <- sort(unique(results_all$agegroup))
+
+for (ag in agegroups) {
+  plot_df <- results_all %>%
+    filter(agegroup == ag, year == forecast_year)
+  
+  p <- ggplot(plot_df, aes(x = date)) +
+    geom_line(aes(y = outcome), color = "#0f77b4", linewidth = 0.3) +
+    geom_line(aes(y = expected), color = "#ff7f0e", linewidth = 1.1) +
+    labs(
+      title = paste("Observed vs expected 3 év - korcsoport:", ag),
+      x = "Dátum",
+      y = "Halálozási esetszám"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5)
+    )
+  print(p)
+}
+
+prediction_T_1_C <- predictions_3y 
+```
+
+
+```{r}
+# ===================================================================
+#      AGGREGÁLT POPULÁCIÓS HALÁLOZÁSI IDŐSOR ELŐÁLLÍTÁSA
+# ===================================================================
+# Cél:
+#   A 21-23 évre előrejelzett baseline (predictions_3y) tartalmazza
+#   minden korcsoportra külön az observed és expected értékeket.
+#
+#   Ez a blokk ezeket összevonja:
+#       - outcome_total      = megfigyelt halálozás összegzése
+#       - expected_total     = modell által becsült baseline
+#       - expected_int_total = integerre kerekített baseline
+#
+#   Az eredmény egyetlen idősor, amely a teljes populációra nézve
+#   mutatja a halálozás időbeli alakulását.
+# ===================================================================
+agg_daily <- predictions_3y %>%
+  group_by(date) %>%
+  summarise(
+    outcome_total = sum(outcome, na.rm = TRUE),
+    expected_total = sum(expected, na.rm = TRUE),
+    expected_int_total = sum(expected_int, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+
+kable(agg_daily,
+      caption = "Aggregált adatsor áttekintése",
+      booktabs = TRUE) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  scroll_box(height = "400px")
+
+
+ggplot(agg_daily, aes(x = date)) +
+  geom_line(aes(y = outcome_total, color = "Observed"), linewidth = 0.6) +
+  geom_line(aes(y = expected_total, color = "Predicted"), linewidth = 1.1) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#0f77b4",
+      "Predicted" = "#ff7f0e"
+    ),
+    labels = c(
+      "Observed" = "Megfigyelt halálozás",
+      "Predicted" = "Prediktált halálozás"
+    ),
+    name = NULL
+  ) +
+  labs(
+    x = "Dátum",
+    y = "Halálozási esetszám"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+
+#write.csv(agg_daily, "TEST_1_C_aggregated_observed_expected.csv", row.names = FALSE)
+```
+
+
+
+## Aggregált adatsor szerinti elemzés
+
+A módszer lényege, hogy minden dátum esetében összeadom a populációt, azaz az egyes korcsoportokhoz tartozó megfigyeléseket és becslést végzek a várható halálozási értékekre. Ennek érdekében előáll egy olyan aggregált, heti bontású idősor, amely a tejes népesség halálozásának dinamikáját tükrözi. Az összesített idősor által kapott eredményeket a későbbiekben összehasonlítom a korábbi pont eredményeivel.
+
+
+### Aggregált adatsor szerinti elemzés: 20 ÉV TANÍTÁS + 1 ÉVES ELŐREJELZÉS
+
+```{r test_2_A}
+# ===================================================================
+# Cél:
+#   Az összes korcsoport összeadásával képzett teljes populációs
+#   halálozási idősoron alkalmazzuk az Acosta–Irizarry baseline modellt.
+# ===================================================================
+
+#-----------------------------------------------------------
+# 1. Adathalmaz előkészítése
+#-----------------------------------------------------------
+data <- data_original
+
+
+#-----------------------------------------------------------
+# 2. Évek meghatározása
+#-----------------------------------------------------------
+data$date <- as.Date(data$date)
+years <- sort(unique(year(data$date)))
+
+baseline_years <- years[1:20]
+forecast_year <- years[21]
+
+
+#-----------------------------------------------------------
+# 3. A 21. év dátumai
+#-----------------------------------------------------------
+exclude_dates <- data %>%
+  filter(year(date) %in% forecast_year) %>%
+  pull(date)
+
+
+#-----------------------------------------------------------
+# 4. Halálozási adatok lista
+#-----------------------------------------------------------
+data_sum <- data %>%
+  mutate(
+    outcome = rowSums(select(., -date), na.rm = TRUE)) %>%
+  select(date, outcome) %>%
+  mutate(
+    population = 1,
+    year = year(date)
+  )
+  
+kable(data_sum,
+      caption = "Összesített táblázat",
+      booktabs = TRUE) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  scroll_box(height = "400px")
+
+expected_df <- compute_expected(
+  counts          = data_sum,
+  exclude         = exclude_dates,
+  frequency       = 52,
+  weekday.effect  = FALSE,
+  keep.components = TRUE,
+  verbose         = FALSE
+)
+
+
+# -----------------------------------------------------------
+# 5. Eredmények összefűzése egyetlen adatkeretbe
+# -----------------------------------------------------------
+results_all <- bind_rows(expected_df)
+
+
+# -----------------------------------------------------------
+# 6. Csak a 21. év előrejelzésének kiszedése
+# -----------------------------------------------------------
+predictions_1y <-results_all %>%
+  filter(year %in% forecast_year) %>%
+  select(date, outcome, expected, excluded) %>%
+  mutate(expected_int = round(expected))
+
+
+# -----------------------------------------------------------
+# 7. Eredmények táblázatos megjelenítése
+# -----------------------------------------------------------
+kable(predictions_1y,
+      caption = "Eredményül kapott adatsor",
+      booktabs = TRUE) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  scroll_box(height = "400px")
+  
+#write.csv(predictions_1y, "TEST_2_A_prediction_1year_all_age.csv", row.names = FALSE)
+#write.csv(results_all, "TEST_2_A_expected_outcome_of_all_years_all_age.csv", row.names = FALSE)
+
+
+# -----------------------------------------------------------
+# 8. Vizualizáció: Observed vs Expected
+# -----------------------------------------------------------
+ggplot(predictions_1y, aes(x = date)) +
+  geom_line(aes(y = outcome, color = "Observed"), linewidth = 0.6) +
+  geom_line(aes(y = expected, color = "Predicted"), linewidth = 1.1) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#0f77b4",
+      "Predicted" = "#ff7f0e"
+    ),
+    labels = c(
+      "Observed" = "Megfigyelt halálozás",
+      "Predicted" = "Prediktált halálozás"
+    ),
+    name = NULL
+  ) +
+  labs(
+    x = "Dátum",
+    y = "Halálozási esetszám"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+
+prediction_T_2_A <- predictions_1y
+```
+
+
+### Aggregált adatsor szerinti elemzés: 20 ÉV TANÍTÁS + 2 ÉVES ELŐREJELZÉS
+
+
+```{r test_2_B}
+#-----------------------------------------------------------
+# 1. Adathalmaz előkészítése
+#-----------------------------------------------------------
+data <- data_original
+
+
+#-----------------------------------------------------------
+# 2. Évek meghatározása
+#-----------------------------------------------------------
+data$date <- as.Date(data$date)
+years <- sort(unique(year(data$date)))
+
+baseline_years <- years[1:20]
+forecast_year <- years[21:22]
+
+
+#-----------------------------------------------------------
+# 3. A 21. év dátumai
+#-----------------------------------------------------------
+exclude_dates <- data %>%
+  filter(year(date) %in% forecast_year) %>%
+  pull(date)
+
+
+#-----------------------------------------------------------
+# 4. Halálozási adatok lista
+#-----------------------------------------------------------
+data_sum <- data %>%
+  mutate(
+    outcome = rowSums(select(., -date), na.rm = TRUE)) %>%
+  select(date, outcome) %>%
+  mutate(
+    population = 1,
+    year = year(date)
+  )
+  
+kable(data_sum,
+      caption = "Összesített táblázat",
+      booktabs = TRUE) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  scroll_box(height = "400px")
+
+expected_df <- compute_expected(
+  counts          = data_sum,
+  exclude         = exclude_dates,
+  frequency       = 52,
+  weekday.effect  = FALSE,
+  keep.components = TRUE,
+  verbose         = FALSE
+)
+
+
+# -----------------------------------------------------------
+# 5. Eredmények összefűzése egyetlen adatkeretbe
+# -----------------------------------------------------------
+results_all <- bind_rows(expected_df)
+
+
+# -----------------------------------------------------------
+# 6. 21-22 évek előrejelzésének kiszedése
+# -----------------------------------------------------------
+predictions_1y <-results_all %>%
+  filter(year %in% forecast_year) %>%
+  select(date, outcome, expected, excluded) %>%
+  mutate(expected_int = round(expected))
+
+
+# -----------------------------------------------------------
+# 7. Eredmények táblázatos megjelenítése
+# -----------------------------------------------------------
+kable(predictions_1y,
+      caption = "Eredményül kapott adatsor",
+      booktabs = TRUE) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  scroll_box(height = "400px")
+  
+#write.csv(predictions_1y, "TEST_2_B_prediction_2year_all_age.csv", row.names = FALSE)
+#write.csv(results_all, "TEST_2_B_expected_outcome_of_all_years_all_age.csv", row.names = FALSE)
+
+
+# -----------------------------------------------------------
+# 8. Vizualizáció: Observed vs Expected
+# -----------------------------------------------------------
+ggplot(predictions_1y, aes(x = date)) +
+  geom_line(aes(y = outcome, color = "Observed"), linewidth = 0.6) +
+  geom_line(aes(y = expected, color = "Predicted"), linewidth = 1.1) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#0f77b4",
+      "Predicted" = "#ff7f0e"
+    ),
+    labels = c(
+      "Observed" = "Megfigyelt halálozás",
+      "Predicted" = "Prediktált halálozás"
+    ),
+    name = NULL
+  ) +
+  labs(
+    x = "Dátum",
+    y = "Halálozási esetszám"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+
+prediction_T_2_B <- predictions_1y
+```
+
+
+### Aggregált adatsor szerinti elemzés: 20 ÉV TANÍTÁS + 3 ÉVES ELŐREJELZÉS
+
+```{r test_2_C}
+#-----------------------------------------------------------
+# 1. Adathalmaz előkészítése
+#-----------------------------------------------------------
+data <- data_original
+
+
+#-----------------------------------------------------------
+# 2. Évek meghatározása
+#-----------------------------------------------------------
+data$date <- as.Date(data$date)
+years <- sort(unique(year(data$date)))
+
+baseline_years <- years[1:20]
+forecast_year <- years[21:23]
+
+
+#-----------------------------------------------------------
+# 3. A 21. év dátumai
+#-----------------------------------------------------------
+exclude_dates <- data %>%
+  filter(year(date) %in% forecast_year) %>%
+  pull(date)
+
+
+#-----------------------------------------------------------
+# 4. Halálozási adatok lista
+#-----------------------------------------------------------
+data_sum <- data %>%
+  mutate(
+    outcome = rowSums(select(., -date), na.rm = TRUE)) %>%
+  select(date, outcome) %>%
+  mutate(
+    population = 1,
+    year = year(date)
+  )
+  
+kable(data_sum,
+      caption = "Összesített táblázat",
+      booktabs = TRUE) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  scroll_box(height = "400px")
+
+expected_df <- compute_expected(
+  counts          = data_sum,
+  exclude         = exclude_dates,
+  frequency       = 52,
+  weekday.effect  = FALSE,
+  keep.components = TRUE,
+  verbose         = FALSE
+)
+
+
+# -----------------------------------------------------------
+# 5. Eredmények összefűzése egyetlen adatkeretbe
+# -----------------------------------------------------------
+results_all <- bind_rows(expected_df)
+
+
+# -----------------------------------------------------------
+# 6. 21-23 évek előrejelzésének kiszedése
+# -----------------------------------------------------------
+predictions_1y <-results_all %>%
+  filter(year %in% forecast_year) %>%
+  select(date, outcome, expected, excluded) %>%
+  mutate(expected_int = round(expected))
+
+
+# -----------------------------------------------------------
+# 7. Eredmények táblázatos megjelenítése
+# -----------------------------------------------------------
+kable(predictions_1y,
+      caption = "Eredményül kapott adatsor",
+      booktabs = TRUE) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  scroll_box(height = "400px")
+  
+#write.csv(predictions_1y, "TEST_2_C_prediction_3year_all_age.csv", row.names = FALSE)
+#write.csv(results_all, "TEST_2_C_expected_outcome_of_all_years_all_age.csv", row.names = FALSE)
+
+
+# -----------------------------------------------------------
+# 8. Vizualizáció: Observed vs Expected
+# -----------------------------------------------------------
+ggplot(predictions_1y, aes(x = date)) +
+  geom_line(aes(y = outcome, color = "Observed"), linewidth = 0.6) +
+  geom_line(aes(y = expected, color = "Predicted"), linewidth = 1.1) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#0f77b4",
+      "Predicted" = "#ff7f0e"
+    ),
+    labels = c(
+      "Observed" = "Megfigyelt halálozás",
+      "Predicted" = "Prediktált halálozás"
+    ),
+    name = NULL
+  ) +
+  labs(
+    x = "Dátum",
+    y = "Halálozási esetszám"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+
+prediction_T_2_C <- predictions_1y
+```
+
+
+
+## Összehasonlítás statisztikai hibamutatók segítségével
+
+Az előrejelzési modell teljesítményét a következő standard hibamutatókkal értékelem:
+**Mean Squared Error (MSE)**,
+**Root Mean Squared Error (RMSE)**,
+és **Mean Absolute Error (MAE)**.
+
+Az alábbi táblázat összefoglalja a mutatók definícióját és matematikai képletét:
+
+
+| Mutató | Definíció | Képlet |
+|-------|-----------|--------|
+| **MSE** | Átlagos négyzetes hiba. A becsült és megfigyelt értékek eltérésének négyzetét átlagoljuk. | $$\text{MSE} = \frac{1}{n}\sum_{i=1}^{n}(y_i - \hat{y}_i)^2$$ |
+| **RMSE** | Gyökös átlagos négyzetes hiba. A MSE négyzetgyöke, az eltérés mértékegységét megőrzi. | $$\text{RMSE} = \sqrt{\frac{1}{n}\sum_{i=1}^{n}(y_i - \hat{y}_i)^2}$$ |
+| **MAE** | Átlagos abszolút hiba. A becsült és megfigyelt értékek eltérésének abszolút értékét átlagoljuk. | $$\text{MAE} = \frac{1}{n}\sum_{i=1}^{n}\left|y_i - \hat{y}_i\right|$$ |
+
+
+```{r}
+
+#-----------------------------------------------------------
+# 1. Felhasználandó dataframe-ek listába rendezése
+#-----------------------------------------------------------
+
+df_list <- list(
+  TEST_1_A = prediction_T_1_A,
+  TEST_1_B = prediction_T_1_B,
+  TEST_1_C = prediction_T_1_C,
+  TEST_2_A = prediction_T_2_A,
+  TEST_2_B = prediction_T_2_B,
+  TEST_2_C = prediction_T_2_C
+)
+
+#-----------------------------------------------------------
+# 2. Hibaszámító függvény
+#-----------------------------------------------------------
+
+compute_metrics <- function(df) {
+  errors <- df$outcome - df$expected
+  errors_int <- df$outcome - df$expected_int
+  
+  MSE  <- mean(errors^2, na.rm = TRUE)
+  RMSE <- sqrt(mean(errors^2, na.rm = TRUE))
+  MAE  <- mean(abs(errors), na.rm = TRUE)
+  
+  MSE_int  <- mean(errors_int^2, na.rm = TRUE)
+  RMSE_int <- sqrt(mean(errors_int^2, na.rm = TRUE))
+  MAE_int  <- mean(abs(errors_int^2), na.rm = TRUE)
+  
+  return (c(MSE = MSE, RMSE = RMSE, MAE = MAE, MSE_int = MSE_int, RMSE_int = RMSE_int, MAE_int = MAE_int))
+}
+
+#-----------------------------------------------------------
+# 3. Függvény alkalmazása a listában levő dataframe-ekre
+#-----------------------------------------------------------
+
+results_error <- lapply(df_list, compute_metrics)
+
+#-----------------------------------------------------------
+# 4. Táblázat/mátrix formára alakítás
+#-----------------------------------------------------------
+
+metrics_table <- do.call(rbind, results_error)
+
+#-----------------------------------------------------------
+# 5. Eredmények megjelenítése
+#-----------------------------------------------------------
+
+kable(metrics_table,
+      caption = "MSE, RMSE és MAE összehasonlítása különböző modellek között",
+      booktabs = TRUE,
+      digits = 4) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  )
+
+#write.csv(metrics_table, "Kiertekelt_eredmenyek_tablazata.csv", row.names = TRUE)
+
+```
+
+

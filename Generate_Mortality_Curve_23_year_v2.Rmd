@@ -1,0 +1,705 @@
+---
+title: "Realisztikus Mortalitási Görbe Generálása"
+author: "Varga Zoltan"
+date: "2025-09-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## **Bevezetés**
+
+A halandósági görbék értelmezése és vizsgálata lehetővé teszi a kutatók számára, hogy elemezzék, miként változnak a halálozási mintázatok az időben. Másképpen fogalmazva: a halandósági görbék betekintést nyújtanak a halálozás alakulásába és annak szerkezetébe. Ezek az elemzések kulcsszerepet játszanak a demográfiai és epidemiológiai kutatásokban, mivel feltárják, hogy a hpsszú távú trendek, szezonális hatások és a váratlan sokkok miként formálják a halálozást a populációkban. Emellett a halandósági görbék kiemelten fontosak a többlethalálozás vizsgálatában. A többlethalálozás becslésekor különösen fontos, hogy a "normál" időszakokra vonatkozó, realisztikus halálozási mintázatot ismerjük. 
+
+A vizsgálat egyik jól bevállt módszertana, hogy a modellt elsőnek egy generált, realisztikusa adatsoron teszteljük, majd a kapott eredményeket összehasonlítjuk egymással. Ennek érdekében a realisztikus haladósági görbék előállítása elengedhetetlen a módszertani fejlesztésekhez és a statisztikai modellek teszteléséhez.
+
+A szintetikus tesztadatok előállítása több okból kritikus:
+
+  - objektív összehasonlítást tesz lehetővé különböző modellek között,
+  - lehetőséget ad módszertani fejlesztések kiértékelésére
+  - kiküszöböli a valós adatokból eredő hibát, adatminőségi problémákat.
+
+
+### A modell matematikai leírása
+
+A szimulált halandósági görbe az alábbi komponensek összegzésével jön létre:
+
+  1) Időskála
+  2) Deomgráfiai szerkezet és trend
+  3) Bázis halálozási ráta
+  4) Szezonalitás
+  5) Rövid idejű sokkok
+  6) Véletlen zaj hatás
+
+
+# **Megvalósítás**
+
+## 1. Könyvtárak betöltése
+
+```{r konyvtarak_betoltese, warning=FALSE, message=FALSE}
+# ---------------------------------------------------------------
+# Könyvtárak betöltése
+# Ezek szükségesegk az adattisztításhoz, időkezeléshez,
+# táblázatformázáshoz és az adatvizualizációhoz.
+# ---------------------------------------------------------------
+library(dplyr) 
+library(lubridate) 
+library(tidyr)
+library(kableExtra)
+library(knitr)
+library(ggplot2)
+library(scales)
+```
+
+## 2. Korcsoportok konfigurációja
+
+```{r korcsoport_konfiguracio}
+
+# ---------------------------------------------------------------
+# Korcsoport konfigurációs adatok létrehozása
+# ---------------------------------------------------------------
+nmb_week <- 52.18 # Az év heteinek átlagos száma
+
+age_groups <- tibble::tibble(
+  labels = c("0-4","5-9","10-14","15-19","20-24",
+            "25-29","30-34","35-39","40-44","45-49",
+            "50-54","55-59","60-64","65-69","70-74",
+            "75-79","80+"),
+  
+  # induló népesség-arány
+  share_start = c(0.045,0.046,0.05,0.048,0.052,
+                  0.053,0.061,0.065,0.064,0.069,
+                  0.072,0.074,0.071,0.066,0.06,
+                  0.048,0.056),
+  
+  # éves arány trend
+  share_trend_per_year = c(-0.0014,-0.0014,-0.0012,-0.0010,-0.0009,
+                           -0.0008,-0.0006,-0.0004,-0.0002,0.0000,
+                           0.0001,0.0002,0.0004,0.0010,0.0014,
+                           0.0020,0.0032),
+  
+  # éves halálozási ráták (százalék), hetekre átszámítva
+  rate_base = c(
+    0.13,  # 0-4
+    0.05,  # 5-9
+    0.05,  # 10-14
+    0.06,  # 15-19
+    0.07,  # 20-24
+    0.08,  # 25-29
+    0.09,  # 30-34
+    0.11,  # 35-39
+    0.13,  # 40-44
+    0.20,  # 45-49
+    0.32,  # 50-54
+    0.47,  # 55-59
+    0.70,  # 60-64
+    1.08,  # 65-69
+    2.50,  # 70-74
+    4.50,  # 75-79
+    7.50   # 80+
+  ) / 100 / nmb_week,
+  
+  # éves trend a rátára 
+  rate_trend_per_year = c(-0.021853,-0.016853,-0.014853,-0.006853,-0.004853,
+                          -0.002853,-0.000853,0.001147,0.003147,0.004147,
+                          0.005147,0.006147,0.007147,0.008147,0.009147,
+                          0.010147,0.014647),
+  
+  # szezonalitás amplitúdói 
+  amp1 = seq(0.03, 0.18, length.out = 17), 
+  amp2 = seq(0.01, 0.05, length.out = 17)
+)
+
+
+# Trendmeredekségek hozzárendelése korcsoporotnként
+slopes <- seq(-0.01, 0.008, length.out = 17)
+
+```
+
+
+## 3. Segédfüggvények
+
+```{r segedfüggvények}
+
+# -------------------------------------------------------------------
+# 1) Heti dátumindex előállítása
+#
+# Ez a függvény egy kezdő- és egy záró dátum között generál egy 
+# heti felbontású date-sorozatot.
+#
+# Paraméterek:
+#   start: karakterlánc, a kezdődátum (YYYY-MM-DD)
+#   end:   karakterlánc, a záródátum (YYYY-MM-DD)
+#
+# Kimenet:
+#   Date vektor, amely "week" lépésközzel halad.
+#
+# Használata:
+#   weekly_index("2023-01-01", "2023-12-31")
+# -------------------------------------------------------------------
+weekly_index <- function(start="2015-01-05", end="2015-12-29") {
+  seq.Date(as.Date(start), as.Date(end), by = "week")
+}
+
+wkl_ndx <- weekly_index(start="2023-01-01", end="2023-12-31") # heti dátumindex előállításának használata
+#head(weekly_index(start="2023-01-01", end="2023-12-31"), 10) # printelés
+
+
+# -------------------------------------------------------------------
+# 2) Évbeli fázis számítása
+#
+# A szezonális komponenst meghatározó szinuszfüggvény miatt fontos,
+# hogy a dátumot 0–1 intervallumra skálázzuk, ahol:
+#   0   ~ január 1.
+#   0.5 ~ július közepe
+#   1   ~ december vége
+#
+# Paraméter:
+#   dates – Date vektor
+#
+# Kimenet:
+#   numeric vektor 0 és 1 között
+# -------------------------------------------------------------------
+year_fraction <- function(dates) {
+  (yday(dates) - 1) / 365.25 # a dátum éven belüli arányra képzése. 
+}
+
+
+# -------------------------------------------------------------------
+# 3) Szezonális multiplikátor (Fourier-bővítéssel)
+#
+# A szezonális moduláció a halandósági ráta időbeli periodikus
+# ingadozását modellezi.
+#
+# Paraméterek:
+#   dates    – Date vektor
+#   amp1     – az éves fő komponenst szabályozó amplitúdó
+#   amp2     – a fél éves második komponens amplitúdója
+#   phase    – fáziseltolás, amely meghatározza, hová essen a maximum
+#
+# Kimenet:
+#   numeric vektor, multiplikatív szezonális szorzó
+# -------------------------------------------------------------------
+seasonal_multiplier <- function(dates, amp1=0.12, amp2=0.04, phase = 0.08) {
+  y <- year_fraction(dates)
+  1 + amp1 * sin(2*pi*(y - phase)) + amp2 * sin(4*pi*(y - phase)) 
+}
+
+
+# -------------------------------------------------------------------
+# 4) Trendmultiplikátor: lineáris vagy exponenciális modell
+#
+# Paraméterek:
+#   dates           – Date vektor
+#   slope_per_year  – éves meredekség; lehet skalár vagy vektor
+#   ref_date        – ehhez viszonyítjuk az eltelt évek számát
+#   type            – "exp" (exponenciális) vagy "linear"
+#
+# Ha slope_per_year vektor (pl. korcsoportonkénti trend),
+# a függvény egy N×G mátrixot ad vissza.
+# -------------------------------------------------------------------
+trend_multiplier <- function(dates,
+                             slope_per_year = 0, # lehet skalár vagy vektor (pl. korcsoportonként)
+                             ref_date = min(dates), # ehhez képest számoljuk az eltelt időt
+                             type = c("exp", "linear")) {
+  
+  type <- match.arg(type)
+
+  t_years <- as.numeric(as.Date(dates) - as.Date(ref_date)) / 365.25 # eltelt évek
+  
+  # Ha a slope_per_year vektor, térjük vissza n x G mátrixszal
+  if (length(slope_per_year) > 1L) {
+    S <- matrix(slope_per_year, nrow = length(t_years), ncol = length(slope_per_year), byrow = TRUE)
+    T <- matrix(t_years, nrow = length(t_years), ncol = length(slope_per_year), byrow=FALSE)
+    if (type == "exp") {
+      return( (1 + S)^T )
+    } else {
+      return( 1 + S*T )
+    }
+  } else {
+    # skalár meredekség -> vektor
+    s <- slope_per_year
+    if (type == "exp") {
+      return( (1 + s)^t_years )
+    } else {
+      return( 1 + s*t_years)
+    }
+  }
+}
+
+dates <- weekly_index(start="2023-01-02", end="2023-12-25") 
+trend_mat <- trend_multiplier(dates, slope_per_year = slopes, type="exp")
+
+
+# -------------------------------------------------------------------
+# 5) Sztochasztikus halálozásszámok generálása
+#
+# Paraméterek:
+#   mu            – várt érték (mátrix vagy vektor)
+#   distribution  – "deterministic", "poisson", "gamma_poisson"
+#   nb_size       – overdiszperziós paraméter (nagy -> kisebb szórás)
+#   seed          – replikálhatóság
+#
+# Kimenet:
+#   szimulált halálozási számok
+# -------------------------------------------------------------------
+draw_counts <- function(mu,
+                        distribution = c("deterministic", "poisson", "gamma_poisson"),
+                        nb_size = 10, # overdiszperzió: nagyobb = kevesebb szórás
+                        seed = NULL) {
+  
+  distribution <- match.arg(distribution)
+  
+  #lapítsuk vektorra
+  mu_vec <- as.vector(mu)
+  mu_vec <- pmax(mu_vec, 0) # negatív numerikus zaj ellen biztosíték
+  
+  if (!is.null(seed)) set.seed(seed)
+  
+  if (distribution == "deterministic") {
+    return(mu_vec)
+  } else if (distribution == "poisson") {
+    return(stats::rpois(length(mu_vec), lambda = mu_vec))
+  } else {
+    size_vec <- if (length(nb_size) == 1L) rep(nb_size, length(mu_vec)) else nb_size
+    return(stats::rnbinom(length(mu_vec), size = size_vec, mu = mu_vec))
+  }
+}
+
+
+# -------------------------------------------------------------------
+# 6) Téli sokk generálása (pl. influenza-szezon)
+#
+# Matematikai forma:
+#   ha t < peak: exp(t / rise)
+#   ha t > peak: exp(-t / decay)
+#
+# Paraméterek:
+#   peak_date       – minden évben a csúcs dátuma (MM-DD)
+#   rise_weeks      – felfutási sebesség
+#   decay_weeks     – lecsengés sebessége
+#   age_sensitivity – sokk nagysága
+#   random_intensity– hozzáadott zaj mértéke
+# -------------------------------------------------------------------
+shock_multiplier <- function(dates,
+                             peak_date = "01-25", # minden évben január 25 a téli csúcs
+                             rise_weeks = 2,
+                             decay_weeks = 6,
+                             age_sensitivity = 0.3,
+                             random_intensity = 0.05,
+                             seed = NULL) {          
+  
+  if (!is.null(seed)) set.seed(seed)
+  
+  years <- unique(format(dates, "%Y"))
+  
+  shock_list <- lapply(years, function(y) {
+    peak_date <- as.Date(paste0(y, '-', peak_date))
+    t_weeks <- as.numeric(as.Date(dates) - peak_date) / 7
+    
+    shape <- ifelse(t_weeks < 0,
+                    exp(t_weeks / rise_weeks),    # gyors felfutás
+                    exp(-t_weeks / decay_weeks))  # lassú lefutás
+    
+    base <- 1 + age_sensitivity * shape
+    
+    noise <- rnorm(length(dates), 0, random_intensity)
+    base * (1 + noise)
+    
+  })
+  
+  shock_total <- Reduce('*', shock_list)
+  
+  shock_total[shock_total < 0] <- 0
+  return(shock_total)
+}
+
+
+# -------------------------------------------------------------------
+# 7) Nyári sokk generálása (pl. hőhullám)
+#
+# Paraméterek megegyeznek a téli sokkéval,
+# csak az időtartam és erősség jellemzően rövidebb.
+# -------------------------------------------------------------------
+shock_multiplier_summer <- function(dates,
+                                    peak_date = "07-20",      # július 20 körül nyári csúcs
+                                    rise_weeks = 1,
+                                    decay_weeks = 1,
+                                    age_sensitivity = 0.3,
+                                    random_intensity = 0.05,
+                                    seed = NULL) {
+  
+  if (!is.null(seed)) set.seed(seed)
+  
+  years <- unique(format(dates, '%Y'))
+
+  shock_list <- lapply(years, function(y) {
+    peak_date <- as.Date(paste0(y, '-', peak_date))
+    t_weeks <- as.numeric(as.Date(dates) - peak_date) / 7
+    
+    shape <- ifelse(t_weeks < 0,
+                    exp(t_weeks / rise_weeks),
+                    exp(-t_weeks / decay_weeks))
+    
+    base <- 1 + age_sensitivity * shape
+    noise <- rnorm(length(dates), 0, random_intensity)
+    
+    base * (1 + noise)
+    
+    
+  })  
+  
+  shock_total <- Reduce("*", shock_list)
+  
+  shock_total[shock_total < 0] <- 0
+  return(shock_total)
+}
+```
+
+
+## 4. Korcsoportonkénti szimuláció
+```{r tobb_korcsoport_szimuacioja}
+
+# ===================================================================
+#   TÖBB KORCSOPORT EGYÜTTES MORTALITÁSI SZIMULÁCIÓJA
+#
+#   simulate_mortality()
+#
+#   Ez a függvény a megadott időszakra több korcsoportra generál
+#   realisztikus halálozási adatokat. A modell komponensei:
+#
+#     - demográfiai korcsoport-arányok időbeli változása
+#     - korcsoportonként eltérő alap halálozási ráta
+#     - hosszú távú trend (exponenciális)
+#     - szezonális komponens (Fourier-összetevők)
+#     - téli influenza-sokk (exponenciális felfutás-lecsengés)
+#     - nyári hőhullám-sokk (rövid, intenzív)
+#     - opcionálisan Poisson vagy Gamma–Poisson zaj
+#
+#   A kimenet:
+#       - "long" adatkeret: minden dátum × korcsoport × komponens
+#
+# ===================================================================
+simulate_mortality <- function(
+    age_groups,
+    slopes,
+    start = "2001-01-01",
+    end = "2023-12-25",
+    population = 9700000,
+    season_phase = 0.08,
+    weeks_per_year = 52.1775,
+    distribution = c("deterministic", "poisson", "gamma_poisson"),
+    nb_size = 10,
+    seed = NULL) {
+  
+  
+  distribution <- match.arg(distribution)
+  
+  
+  # ---------------------------------------------------------------
+  # 1) Bemeneti ellenőrzés
+  # ---------------------------------------------------------------
+  req_cols <- c("labels","share_start","share_trend_per_year",
+                "rate_base","rate_trend_per_year","amp1","amp2")
+  stopifnot(all(req_cols %in% names(age_groups)))
+  G <- nrow(age_groups)           # kocsoportok száma
+  stopifnot(length(slopes) == G)  # ugyanannyi trend-meredekség legyen, mint korcsoport
+  
+  
+  # ---------------------------------------------------------------
+  # 2) Időskála felépítése (heti dátumindex)
+  # ---------------------------------------------------------------
+  dates   <- weekly_index(start, end)
+  n       <- length(dates)
+  t_years <- as.numeric(as.Date(dates) - as.Date(min(dates))) / 365.25
+  
+  
+  # ---------------------------------------------------------------
+  # 3) Demográfiai korcsoport-arányok időbeli változása
+  #
+  # share_g(t) = share_start_g + share_trend_g * t
+  # A soronkénti normalizálás biztosítja, hogy mindig 1-re summázzon.
+  # ---------------------------------------------------------------
+  age_groups_over_time <- sapply(seq_len(G), function(g) {
+    age_groups$share_start[g] + age_groups$share_trend_per_year[g]*t_years
+  })
+  age_groups_over_time_normalt <- age_groups_over_time / rowSums(age_groups_over_time)
+  
+  
+  # ---------------------------------------------------------------
+  # 4) Bázis halálozási ráta + trend
+  #
+  # rate_base(g) * (1 + rate_trend_g * t)
+  #
+  # A rate_base már hetekre van konvertálva a bemenetben.
+  # ---------------------------------------------------------------
+  rate_base_mort <- matrix(age_groups$rate_base, nrow = n, ncol = G, byrow=TRUE)
+  rate_trend_mort <- sapply(seq_len(G), function(g) {
+    (1 + age_groups$rate_trend_per_year[g] * t_years)
+  }) 
+  rate_mort <- rate_base_mort * rate_trend_mort
+  
+  
+  # ---------------------------------------------------------------
+  # 5) Szezonalitás korcsoportonként
+  #
+  # S_g(t) = 1 + a1_g sin(2π(y-phi)) + a2_g sin(4π(y-phi))
+  # ---------------------------------------------------------------
+  seasonal_mort <- sapply(seq_len(G), function(g) {
+    seasonal_multiplier(
+      dates,
+      amp1 = age_groups$amp1[g],
+      amp2 = age_groups$amp2[g],
+      phase = season_phase
+      )
+  })
+  
+  
+  # ---------------------------------------------------------------
+  # 6) Hosszú távú trend (exponenciális modell)
+  #
+  # T_g(t) = (1 + slope_g)^t
+  #
+  # A trend_multiplier vektoros bemenet esetén egész mátrixot ad vissza.
+  # ---------------------------------------------------------------
+  trend_mort <- trend_multiplier(
+    dates,
+    slope_per_year = slopes,
+    type="exp"
+    )
+  
+  
+  # ---------------------------------------------------------------
+  # 7) Téli influenza-sokk korcsoportonként
+  #
+  # shape_g(t):
+  #   t < peak_date  -> exp(t / rise_weeks)
+  #   t > peak_date  -> exp(-t / decay_weeks)
+  #
+  # az age_sensitivity korcsoportonként nő → idősek érzékenyebbek
+  # ---------------------------------------------------------------
+  shock_mort <- sapply(seq_len(G), function(g) {
+    shock_multiplier(
+      dates,
+      peak_date = "01-25",
+      rise_weeks = 2,
+      decay_weeks = 6,
+      age_sensitivity = seq(0.05, 0.5, length.out = G)[g], # fiatal -> idősek
+      random_intensity = 0.05,
+      seed = 123
+    )
+  })
+  
+  
+  # ---------------------------------------------------------------
+  # 8) Nyári hőhullám-sokk korcsoportonként
+  # ---------------------------------------------------------------
+  shock_mort_summer <- sapply(seq_len(G), function(g) {
+    shock_multiplier_summer(
+      dates,
+      peak_date = "07-20",
+      rise_weeks = 1,
+      decay_weeks = 1,
+      age_sensitivity = seq(0.05, 0.5, length.out = G)[g],
+      random_intensity = 0.05,
+      seed = 123
+    )
+  })
+  
+  
+  # ---------------------------------------------------------------
+  # 9) A teljes mortalitási ráta összerakása
+  #
+  # mu_g(t) = rate × season × trend × winter_shock × summer_shock
+  #
+  # Multiplikatív modell -> faktoronként külön hatás.
+  # ---------------------------------------------------------------
+  mu_mort <- rate_mort *
+    seasonal_mort *
+    trend_mort *
+    shock_mort *
+    shock_mort_summer
+  
+  
+  # ---------------------------------------------------------------
+  # 10) A népesség korcsoport szerinti felosztása
+  #
+  # population_g(t) = share_g(t) * total_population
+  # ---------------------------------------------------------------
+  population_mort <- age_groups_over_time_normalt * population
+  
+  
+  # ---------------------------------------------------------------
+  # 11) Halálozások várható értéke:
+  #
+  # expected_deaths_g(t) = mu_g(t) × population_g(t)
+  # ---------------------------------------------------------------
+  mortality <- population_mort * mu_mort
+  
+  
+  # ---------------------------------------------------------------
+  # 12) Sztochasztikus halálesetszám generálás (opcionális)
+  # ---------------------------------------------------------------
+  deaths <- draw_counts(
+    mu = mortality,
+    distribution = distribution,
+    nb_size = nb_size,
+    seed = seed
+  )
+  
+  
+  # ---------------------------------------------------------------
+  # 13) Kimenet összeállítása „tidy” (long) formátumban
+  # ---------------------------------------------------------------
+  long <- tibble::tibble(
+    date = rep(dates, times = G),
+    group = rep(age_groups$labels, each = n),
+    share = as.vector(age_groups_over_time_normalt),
+    rate_base = as.vector(rate_base_mort),
+    rate_trend = as.vector(rate_trend_mort),
+    seasonal = as.vector(seasonal_mort),
+    trend = as.vector(trend_mort),
+    mortality = as.vector(mortality),        # várható érték
+    deaths = as.integer(round(deaths))       
+  )
+
+  
+  # ---------------------------------------------------------------
+  # 14) Kimenet
+  # ---------------------------------------------------------------
+  list(long = long)
+}
+
+
+# ===================================================================
+# FÜGGVÉNY HÍVÁSA
+# ===================================================================
+sim <- simulate_mortality(
+  age_groups = age_groups,
+  slopes = slopes,
+  start = "2001-01-01",
+  end   = "2023-12-25",
+  population = 9700000,
+  season_phase = 0.08,
+  distribution = "deterministic",
+  seed = 123
+)
+```
+
+
+## 5. Eredmények táblázatos megjelenítése
+```{r Eredmenyek_tablatos_megjelenitese}
+
+# ===================================================================
+#   EREDMÉNYEK TÁBLÁZATOS MEGJELENÍTÉSE
+#
+#   Ebben a blokkban:
+#     1) A sim$long kimenetet felhasználjuk
+#     2) Korrigáljuk a 0–4 korcsoport halálozási értékeit
+#        (az eredeti szimulációban ez megegyezik a 35–39 csoporttal)
+#     3) A date × korcsoport mátrixot pivotáljuk széles formátumba
+#     4) A kableExtra segítségével formázott táblázatot hozunk létre
+#     5) CSV fájlba mentjük az eredményeket
+# ===================================================================
+long_df <- sim$long
+
+
+# -------------------------------------------------------------------
+# 1) Korrigálás: a 0–4 korcsoport halálozása legyen azonos a 35–39 csoporttal
+#
+# Megjegyzés:
+#   A modellben egyes korcsoportok trendje/arányai azonosra sikerülhetnek
+#   -> kutatási célból egyeztetjük a 0–4 értékeket a 35–39 csoporttal.
+# -------------------------------------------------------------------
+long_df <- long_df %>%
+  group_by(date) %>%
+  mutate(
+    deaths = ifelse(group == "0-4",
+                    deaths[group == "35-39"],
+                    deaths),
+    mortality = ifelse(group == "0-4",
+                       mortality[group == "35-39"],
+                       mortality)
+  ) %>%
+  ungroup()
+
+
+# -------------------------------------------------------------------
+# 2) Táblázat összeállítása széles formátumban:
+#      minden sor egy dátum,
+#      minden oszlop egy korcsoport,
+#      érték: a heti halálozások száma.
+# -------------------------------------------------------------------
+df_results <- long_df |>
+  dplyr::select(date, group, deaths) |>
+  tidyr::pivot_wider(names_from = group, values_from = deaths) |>
+  as.data.frame()
+
+
+# -------------------------------------------------------------------
+# 3) Táblázat megjelenítése kableExtra segítségével
+# -------------------------------------------------------------------
+kable(df_results,
+      caption = "Eredmények korcsoportonként való megjelnítése",
+      booktabs = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(1, bold = TRUE) %>%
+  scroll_box(height = "350px")
+
+
+# -------------------------------------------------------------------
+# 4) CSV mentés (kutatási reproducibilitás érdekében)
+# -------------------------------------------------------------------
+write.csv(df_results,
+          file = "df_results_23_years_version2.csv",
+          row.names = FALSE)
+```
+
+
+## 6. Eredmények vizuális megjelenítése
+```{r Eredemyek_vizualis_megjelenitese}
+
+# ===================================================================
+#   EREDMÉNYEK VIZUÁLIS MEGJELENÍTÉSE
+#
+#   Lépések:
+#     1) A széles táblázatot visszaalakítjuk hosszú formátumba
+#     2) Kiválasztunk néhány reprezentatív korcsoportot
+#     3) Idősoros ábrát készítünk logaritmikus Y-skálával
+# ===================================================================
+
+# -------------------------------------------------------------------
+# 1) Átalakítás grafikonhoz: pivot_longer
+# -------------------------------------------------------------------
+df_long_for_plot <- df_results |>
+  tidyr::pivot_longer(-date, names_to = "group", values_to = "death")
+
+
+# -------------------------------------------------------------------
+# 2) Kiválasztott korcsoportok vizsgálata
+#
+# Példa: fiatal – középkorú – idősebb – nagyon idősek
+#
+#   20–24
+#   50–54
+#   65–69
+#   80+
+# -------------------------------------------------------------------
+sel_groups <- c("20-24", "50-54", "65-69", "80+")
+
+
+# -------------------------------------------------------------------
+# 3) Ábra: heti halálozások időben (log skála)
+# -------------------------------------------------------------------
+df_long_for_plot |>
+  dplyr::filter(group %in% sel_groups) |>
+  ggplot(aes(date, death, color = group)) +
+  geom_line(linewidth = 0.6) +
+  scale_y_log10(labels = label_number(accuracy = 1)) +
+  labs(title = "Heti halálozás – kiválasztott korcsoportok (log skála)",
+       x = "Dátum", y = "fő/hét (log10)") +
+  theme_minimal()
+```

@@ -1,0 +1,392 @@
+---
+title: "Untitled"
+author: "Varga Zoltan"
+date: "2025-11-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Előfeltételek
+
+```{r warning=FALSE, message=FALSE}
+
+library(dplyr)
+library(lubridate)
+library(kableExtra)
+library(knitr)
+library(tidyr)
+library(mgcv)
+library(plotly)
+library(eurostat)
+```
+
+## 2D SPLINE WITH MGCV
+
+```{r}
+compute_expected_2d_mgcv <- function(
+    counts,
+    exclude = NULL,
+    include.trend = TRUE,
+    k_time = 20,
+    k_age  = 10,
+    k_season = 10,
+    frequency = NULL,        # most már csak meta infó
+    weekday.effect = FALSE,
+    age_var = "age_mid",
+    verbose = TRUE
+) {
+  # --- 1. Ellenőrzések -------------------------------------------------------
+  required_cols <- c("date", "outcome", age_var)
+  if (!all(required_cols %in% names(counts))) {
+    stop("Hiányzó oszlop(ok): ", paste(required_cols, collapse = ", "))
+  }
+
+  if (!lubridate::is.Date(counts$date))
+    stop("A date oszlopnak Date osztályúnak kell lennie.")
+
+  # population oszlop: ha nincs, legyen 1 (offset nélkül kb. ugyanaz)
+  if (!("population" %in% names(counts))) {
+    if (verbose) message("Nincs 'population' oszlop, beállítom 1-re.")
+    counts$population <- 1
+  }
+
+  # --- 2. Frequency becslés (nem kritikus, de elmentjük meta infónak) -------
+  unique_dates <- sort(unique(counts$date))
+
+  if (is.null(frequency)) {
+    total_days <- as.numeric(max(unique_dates) - min(unique_dates))
+    n_time <- length(unique_dates)
+    frequency <- round(365 / (total_days / n_time))
+    if (verbose)
+      message("Detectált frequency: ", frequency)
+  }
+
+  # --- 3. Segédfüggvény: szökőévek kezelése (Acosta–Irizarry logika) -------
+  noleap_yday <- function(date){
+    yd <- lubridate::yday(date)
+    yd[lubridate::leap_year(date) & yd > 59] <- yd[lubridate::leap_year(date) & yd > 59] - 1
+    yd
+  }
+
+  # --- 4. Extra kovariáták ---------------------------------------------------
+  min_date <- min(counts$date)
+
+  counts <- counts %>%
+    mutate(
+      time_scaled = as.numeric(date - min_date) / 365.25,  # idő években, 0-tól indul
+      age_s       = .data[[age_var]],
+      doy         = noleap_yday(date),
+      wday        = lubridate::wday(date),
+      doy_scaled  = 2 * pi * doy / 365                    # ciklikus inputnak kényelmes
+    )
+
+  # --- 5. Train–test bontás ---------------------------------------------------
+  index <- !(counts$date %in% exclude)
+  counts_fit  <- counts[index, ]
+  counts_pred <- counts
+
+  if (!any(index)) stop("Nincs tanító adat (minden dátum kizárva).")
+
+  # --- 6. GAM formula ---------------------------------------------------------
+  # - te(time_scaled, age_s): hosszú távú trend + age-hatás
+  # - s(doy_scaled, bs="cc"): ciklikus szezonális komponens
+
+  if (weekday.effect) {
+    gam_formula <- outcome ~
+      te(time_scaled, age_s, bs = c("tp","tp"),
+         k = c(k_time, k_age)) +
+      s(doy_scaled, bs = "cc", k = k_season) +
+      factor(wday)
+  } else {
+    gam_formula <- outcome ~
+      te(time_scaled, age_s, bs = c("tp","tp"),
+         k = c(k_time, k_age)) +
+      s(doy_scaled, bs = "cc", k = k_season)
+  }
+
+  if (verbose) {
+    message("GAM formula:\n", deparse(gam_formula))
+  }
+
+  # --- 7. Modell illesztése ---------------------------------------------------
+  fit <- mgcv::gam(
+    formula = gam_formula,
+    family  = quasipoisson(link = "log"),
+    offset  = log(population),
+    data    = counts_fit,
+    method  = "REML"
+  )
+
+  # --- 8. Előrejelzés (train + test) -----------------------------------------
+  eta_all <- predict(fit, newdata = counts_pred, type = "link", se.fit = FALSE)
+  mu_all  <- exp(eta_all)
+
+  # (ha kellene: se.fit = TRUE és Delta-módszerrel log_expected_se, de most 0-ra állítjuk)
+  log_expected_se <- rep(0, nrow(counts_pred))
+
+  # --- 9. Kimenet összeállítása ----------------------------------------------
+  out <- counts_pred %>%
+    mutate(
+      expected = mu_all,
+      log_expected_se = log_expected_se,
+      excluded = !index
+    )
+
+  attr(out, "model")     <- fit
+  attr(out, "frequency") <- frequency
+  attr(out, "type")      <- "mgcv_2d_spline_cc"
+
+  return(out)
+}
+
+
+
+```
+
+
+
+
+## Adatok importálása
+
+```{r }
+
+# Eurostat weekly deaths
+eu <- get_eurostat("demo_r_mwk_05")
+
+# Magyarország, TOTAL sex, korcsoportonként
+hu_raw <- eu %>%
+  filter(geo == "HU", sex == "T", age != "TOTAL") %>%
+  rename(
+    date = TIME_PERIOD,
+    deaths = values
+  ) %>%
+  select(date, age, deaths)
+
+hu_raw <- hu_raw %>%
+  mutate(
+    age_group = as.character(age),
+    age_mid = case_when(
+      age_group == "Y_GE90" ~ 92.5,
+      TRUE ~ (as.numeric(sub("Y", "", sub("-.*", "", age_group))) +
+              as.numeric(sub(".*-", "", age_group))) / 2
+    ),
+    outcome = deaths,
+    population = 1
+  ) %>%
+  select(date, age_group, age_mid, outcome, population)
+
+str(hu_raw$date)
+#hu$date <- as.Date(hu$date)
+
+hu <- hu_raw %>%
+  filter(age_group != "UNK") %>%      # UNK eltávolítása
+  mutate(
+    age_mid = case_when(
+      age_group == "Y_LT5"   ~ 2.5,
+      age_group == "Y_GE90"  ~ 92.5,
+      grepl("^Y[0-9]+-[0-9]+$", age_group) ~ {
+        g <- sub("^Y", "", age_group)
+        low  <- as.numeric(sub("-.*", "", g))
+        high <- as.numeric(sub(".*-", "", g))
+        (low + high) / 2
+      },
+      TRUE ~ NA_real_
+    )
+  )
+
+unique(hu$age_group)
+summary(hu$age_mid)
+
+ggplot(hu, aes(date, outcome)) +
+  geom_line() +
+  facet_wrap(~age_mid, scales="free_y")
+
+
+```
+
+
+# Adatelemzés
+
+### Ábra készítése az adatsorról
+
+#### Korcsoportonkénti ábrázolás
+```{r}
+ggplot(hu, aes(x = date, y = outcome)) +
+  geom_line(color = "#0f77b4", linewidth = 0.4) +
+  facet_wrap(~ age_group, scales = "free_y") +
+  labs(
+    title = "Heti halálozások alakulása korcsoportonként - Magyarország",
+    x = "Dátum",
+    y = "Halálozások száma"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 8),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
+  )
+
+
+```
+
+#### Aggregált halálozások ábrázolása
+```{r}
+hu_agg <- hu %>%
+  group_by(date) %>%
+  summarise(total_deaths = sum(outcome), .groups = "drop")
+
+ggplot(hu_agg, aes(x = date, y = total_deaths)) +
+  geom_line(color = "#d32728", linewidth = 0.8) +
+  labs(
+    title = "Heti halálozások összes korcsoportot tekintve - Magyarország",
+    x = "Dátum",
+    y = "Összes halálozás"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
+  )
+```
+
+#### Kiválasztott korcsoportok egy ábrán
+```{r}
+selected <- hu %>%
+  filter(age_group %in% c("Y50-54", "Y55-59", "Y60-64", "Y65-69", 
+                          "Y70-74", "Y75-79", "Y_GE80"))
+
+ggplot(selected, aes(x = date, y = outcome, color = age_group)) +
+  geom_line(linewidth = 0.6) +
+  labs(
+    title = "Heti halálozások alakulása kiválasztott korcsoportokban",
+    x = "Dátum",
+    y = "Halálozás",
+    color = "Korcsoport"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
+  )
+
+```
+
+
+## Elemzés
+
+```{r}
+## -----------------------------------------
+## Kifejezetten 2019. december 31-ig tanítunk
+## -----------------------------------------
+data_long <- hu
+
+all_dates <- sort(unique(data_long$date))
+
+data_long$year <- lubridate::year(data_long$date)
+
+## TRAIN: 2000–2019
+train_dates <- all_dates[data_long$year <= 2019]
+
+## TEST: 2020+
+test_dates  <- all_dates[data_long$year >= 2020]
+
+## -----------------------------------------
+## Modell illesztése (tanításhoz csak 2019-ig)
+## -----------------------------------------
+expected_all <- compute_expected_2d_mgcv(
+  counts        = data_long,
+  exclude       = test_dates,     
+  age_var       = "age_mid",
+  k_time        = 20,
+  k_age         = 10,
+  k_season      = 10,
+  weekday.effect = FALSE
+)
+
+
+```
+
+### Train-Test szétválasztása
+
+```{r}
+results <- expected_all
+
+train_df <- results %>%
+  filter(!excluded) %>%   # 2019-ig
+  select(date, year, age_mid, observed = outcome, expected)
+
+test_df <- results %>%
+  filter(excluded) %>%    # 2020+
+  select(date, year, age_mid, observed = outcome, expected)
+
+```
+
+
+### Predikció eltérésének kiszámítása
+
+```{r}
+test_diff <- test_df %>%
+  mutate(diff = observed - expected)
+
+kable(
+    test_diff,
+    caption = "Predikciós eltérések",
+    booktabs = TRUE) %>%
+  kable_styling(bootstrap_option = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(1, bold = TRUE) %>%
+  scroll_box(height = "350px")
+
+```
+
+```{r}
+hu %>% summarise(
+  n = n(),
+  na_age_mid = sum(is.na(age_mid)),
+  unique_age = n_distinct(age_group),
+  unique_age_mid = n_distinct(age_mid)
+)
+hu %>% filter(is.na(age_mid)) %>% head(20)
+```
+
+
+## Eredmények ábrázolása
+### Összesített többlethalálozás
+```{r}
+test_total <- test_diff %>%
+  group_by(date) %>%
+  summarise(
+    diff = sum(diff),
+    observed = sum(observed),
+    expected = sum(expected),
+    .groups = "drop"
+  )
+
+ggplot(test_total, aes(x = date, y = diff)) +
+  geom_col(fill = "firebrick", alpha = 0.7) +
+  geom_hline(yintercept = 0, color = "black") +
+  labs(
+    title = "Többlethalálozás időbeli alakulása (2020+)",
+    x = "Dátum",
+    y = "Többlethalálozás (observed – expected)"
+  ) +
+  theme_minimal()
+
+```
+
+
+### Korcsoportonkénti többlethalálozás
+```{r}
+ggplot(test_diff, aes(x = date, y = diff)) +
+  geom_line(color = "darkred") +
+  facet_wrap(~ age_mid, scales = "free_y") +
+  labs(
+    title = "Korcsoportonkénti többlethalálozás (observed – expected)",
+    x = "Dátum",
+    y = "Eltérés"
+  ) +
+  theme_minimal()
+```
+
+
+

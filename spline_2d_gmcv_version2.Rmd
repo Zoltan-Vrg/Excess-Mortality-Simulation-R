@@ -1,0 +1,515 @@
+---
+title: "Továbbfejlesztett Acosta-Irizarry modell 2D spline implementálásával"
+author: "Varga Zoltan"
+date: "2025-11-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Előfeltételek
+
+```{r warning=FALSE, message=FALSE}
+
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(mgcv)
+library(plotly)
+```
+
+## 2D SPLINE MEGVALÓSÍTÁSA MGCV KÖNYVTÁR SEGÍTSÉGÉVEL
+
+```{r}
+compute_expected_2d_mgcv <- function(
+    counts,
+    exclude = NULL,
+    include.trend = TRUE,
+    k_time = 20,
+    k_age  = 10,
+    k_season = 10,
+    frequency = NULL,        # most már csak meta infó
+    weekday.effect = FALSE,
+    age_var = "age_mid",
+    verbose = TRUE
+) {
+  # --- 1. Ellenőrzések -------------------------------------------------------
+  required_cols <- c("date", "outcome", age_var)
+  if (!all(required_cols %in% names(counts))) {
+    stop("Hiányzó oszlop(ok): ", paste(required_cols, collapse = ", "))
+  }
+
+  if (!lubridate::is.Date(counts$date))
+    stop("A date oszlopnak Date osztályúnak kell lennie.")
+
+  # population oszlop: ha nincs, legyen 1 (offset nélkül kb. ugyanaz)
+  if (!("population" %in% names(counts))) {
+    if (verbose) message("Nincs 'population' oszlop, beállítom 1-re.")
+    counts$population <- 1
+  }
+
+  # --- 2. Frequency becslés (nem kritikus, de elmentjük meta infónak) -------
+  unique_dates <- sort(unique(counts$date))
+
+  if (is.null(frequency)) {
+    total_days <- as.numeric(max(unique_dates) - min(unique_dates))
+    n_time <- length(unique_dates)
+    frequency <- round(365 / (total_days / n_time))
+    if (verbose)
+      message("Detectált frequency: ", frequency)
+  }
+
+  # --- 3. Segédfüggvény: szökőévek kezelése (Acosta–Irizarry logika) -------
+  noleap_yday <- function(date){
+    yd <- lubridate::yday(date)
+    yd[lubridate::leap_year(date) & yd > 59] <- yd[lubridate::leap_year(date) & yd > 59] - 1
+    yd
+  }
+
+  # --- 4. Extra kovariáták ---------------------------------------------------
+  min_date <- min(counts$date)
+
+  counts <- counts %>%
+    mutate(
+      time_scaled = as.numeric(date - min_date) / 365.25,  # idő években, 0-tól indul
+      age_s       = .data[[age_var]],
+      doy         = noleap_yday(date),
+      wday        = lubridate::wday(date),
+      doy_scaled  = 2 * pi * doy / 365                    # ciklikus inputnak kényelmes
+    )
+
+  # --- 5. Train–test bontás ---------------------------------------------------
+  index <- !(counts$date %in% exclude)
+  counts_fit  <- counts[index, ]
+  counts_pred <- counts
+
+  if (!any(index)) stop("Nincs tanító adat (minden dátum kizárva).")
+
+  # --- 6. GAM formula ---------------------------------------------------------
+  # - te(time_scaled, age_s): hosszú távú trend + age-hatás
+  # - s(doy_scaled, bs="cc"): ciklikus szezonális komponens
+
+  if (weekday.effect) {
+    gam_formula <- outcome ~
+      te(time_scaled, age_s, bs = c("tp","tp"),
+         k = c(k_time, k_age)) +
+      s(doy_scaled, bs = "cc", k = k_season) +
+      factor(wday)
+  } else {
+    gam_formula <- outcome ~
+      te(time_scaled, age_s, bs = c("tp","tp"),
+         k = c(k_time, k_age)) +
+      s(doy_scaled, bs = "cc", k = k_season)
+  }
+
+  if (verbose) {
+    message("GAM formula:\n", deparse(gam_formula))
+  }
+
+  # --- 7. Modell illesztése ---------------------------------------------------
+  fit <- mgcv::gam(
+    formula = gam_formula,
+    family  = quasipoisson(link = "log"),
+    offset  = log(population),
+    data    = counts_fit,
+    method  = "REML"
+  )
+
+  # --- 8. Előrejelzés (train + test) -----------------------------------------
+  eta_all <- predict(fit, newdata = counts_pred, type = "link", se.fit = FALSE)
+  mu_all  <- exp(eta_all)
+
+  # (ha kellene: se.fit = TRUE és Delta-módszerrel log_expected_se, de most 0-ra állítjuk)
+  log_expected_se <- rep(0, nrow(counts_pred))
+
+  # --- 9. Kimenet összeállítása ----------------------------------------------
+  out <- counts_pred %>%
+    mutate(
+      expected = mu_all,
+      log_expected_se = log_expected_se,
+      excluded = !index
+    )
+
+  attr(out, "model")     <- fit
+  attr(out, "frequency") <- frequency
+  attr(out, "type")      <- "mgcv_2d_spline_cc"
+
+  return(out)
+}
+
+
+
+```
+
+
+
+
+## Adatok importálása
+
+```{r }
+data <- as.data.frame(read.csv2("df_results_23_years_version2_copied.csv",
+                                header = TRUE,
+                                check.names = FALSE,
+                                sep = ","))
+
+data$date <- as.Date(data$date)
+
+# wide -> long
+data_long <- data %>%
+  pivot_longer(
+    cols = -date,
+    names_to = "age_group",
+    values_to = "outcome"
+  ) %>%
+  mutate(
+    age_mid = case_when(
+      age_group == "80+" ~ 82.5,
+      TRUE ~ (as.numeric(sub("-.*", "", age_group)) +
+              as.numeric(sub(".*-", "", age_group))) / 2
+    ),
+    population = 1
+  )
+
+```
+
+
+# Adatelemzés
+
+### 20 év tanítás + 1 év előrejelzés
+
+```{r}
+all_dates <- sort(unique(data_long$date))
+start_date <- min(all_dates)
+
+train_end_date <- start_date + lubridate::years(20)
+
+train_dates <- all_dates[all_dates < train_end_date]
+test_start_date <- train_end_date
+test_end_date   <- train_end_date + lubridate::years(1)
+
+test_dates <- all_dates[all_dates >= test_start_date &
+                        all_dates <  test_end_date]
+
+expected_all <- compute_expected_2d_mgcv(
+  counts = data_long,
+  exclude = test_dates,
+  age_var = "age_mid",
+  k_time = 20,
+  k_age  = 10,
+  k_season = 10,
+  weekday.effect = FALSE
+)
+
+```
+
+### TRAIN - TEST összevető táblázat
+```{r}
+# TRAIN - TEST szétválasztás
+results <- expected_all
+
+# train adatok (tanulási 20 év)
+train_df <- results %>%
+  filter(!excluded) %>%
+  select(date, age_mid, observed = outcome, expected)
+
+# test adatok (1 év előrejelzés)
+test_df <- results %>%
+  filter(excluded) %>%
+  select(date, age_mid, observed = outcome, expected)
+
+
+```
+
+### Hibamértékek (MSE, RMSE, MAE)
+```{r}
+# Error metrikák kiszámítása teszt időszakra
+error_metrics <- test_df %>%
+  mutate(error = observed - expected) %>%
+  summarise(
+    MSE  = mean(error^2),
+    RMSE = sqrt(mean(error^2)),
+    MAE  = mean(abs(error))
+  )
+
+error_metrics
+
+
+```
+
+```{r}
+error_by_age <- test_df %>%
+  mutate(error = observed - expected) %>%
+  group_by(age_mid) %>%
+  summarise(
+    MSE  = mean(error^2),
+    RMSE = sqrt(mean(error^2)),
+    MAE  = mean(abs(error))
+  )
+
+error_by_age
+```
+
+### Ábrázolás 
+```{r}
+# fitted GAM modell
+fit <- attr(expected_all, "model")
+
+# rács létrehozása idő × kor dimenzióban
+time_seq <- seq(
+  min(data_long$date),
+  max(data_long$date),
+  length.out = 80
+)
+
+age_seq <- seq(
+  min(data_long$age_mid),
+  max(data_long$age_mid),
+  length.out = 40
+)
+
+grid <- expand.grid(
+  date    = time_seq,
+  age_mid = age_seq
+)
+
+# a compute_expected_2d_mgcv-ben használt transzformációkat újra kell alkalmazni:
+min_date <- min(data_long$date)
+
+grid <- grid %>%
+  mutate(
+    time_scaled = as.numeric(date - min_date) / 365.25,
+    age_s       = age_mid,
+    doy         = {
+      yd <- lubridate::yday(date)
+      yd[lubridate::leap_year(date) & yd > 59] <- yd[lubridate::leap_year(date) & yd > 59] - 1
+      yd
+    },
+    doy_scaled  = 2 * pi * doy / 365,
+    population  = 1      # vagy ha van valódi populáció, azt betenni
+  )
+
+Z_vec <- predict(fit, newdata = grid, type = "response")
+
+Z <- matrix(Z_vec,
+            nrow = length(time_seq),
+            ncol = length(age_seq),
+            byrow = FALSE)
+
+plot_ly(
+  x = time_seq,
+  y = age_seq,
+  z = ~Z,
+  type = "surface"
+) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Dátum"),
+      yaxis = list(title = "Korcsoport (age_mid)"),
+      zaxis = list(title = "Várt halálozás")
+    )
+  )
+```
+
+### Ábra korcsoportonként (face-grid)
+```{r}
+ggplot(results, aes(x = date)) +
+  geom_line(aes(y = outcome, color = "Observed"), size = 0.6) +
+  geom_line(aes(y = expected, color = "Expected"), size = 0.6) +
+  facet_wrap(~ age_mid, scales = "free_y") +
+  scale_color_manual(values = c("Observed" = "black", "Expected" = "blue")) +
+  labs(title = "Observed vs Expected by Age Group",
+       color = "") +
+  theme_minimal()
+
+
+```
+
+### Az előrejelzett év ábrázolása
+
+```{r}
+test_total <- test_df %>%
+  group_by(date) %>%
+  summarise(
+    observed = sum(observed),
+    expected = sum(expected),
+    .groups = "drop"
+  )
+
+ggplot(test_total, aes(x = date)) +
+  geom_line(aes(y = observed, color = "Observed"), linewidth = 0.6) +
+  geom_line(aes(y = expected, color = "Expected"), linewidth = 1.1) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#0f77b4",
+      "Expected" = "#ff7f0e"
+      ),
+    labels = c(
+      "Observed" = "Megfigyelt halálozás",
+      "Expected" = "Prediktált halálozás"
+    ),
+    name = NULL
+    ) +
+  labs(
+    x = "Dátum",
+    y = "Halálozási esetszám"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+
+```
+
+
+### Az előrejelzett év ábrázolása korcsoportonként
+
+```{r}
+test_only <- test_df
+
+ggplot(test_only, aes(x = date)) +
+  geom_line(aes(y = observed, color = "Observed"), linewidth = 0.7) +
+  geom_line(aes(y = expected, color = "Expected"), linewidth = 0.7) +
+  facet_wrap(~ age_mid, scales = "free_y") +
+  scale_color_manual(values = c("Observed" = "black", "Expected" = "blue")) +
+  labs(
+    title = "Observed vs Expected – 1-Year Forecast by Age Group",
+    x = "Date",
+    y = "Mortality",
+    color = ""
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    strip.text = element_text(size = 10)
+  )
+```
+
+
+## 20 év tanítás + 2 év előrejelzés
+
+```{r}
+
+test_end_date_2 <- train_end_date + lubridate::years(2)
+
+test_dates_2 <- all_dates[all_dates >= test_start_date &
+                          all_dates <  test_end_date_2]
+
+expected_all_2 <- compute_expected_2d_mgcv(
+  counts = data_long,
+  exclude = test_dates_2,
+  age_var = "age_mid",
+  k_time = 20,
+  k_age = 10,
+  k_season = 10,
+  weekday.effect = FALSE
+)
+
+```
+
+### TRAIN- TEST összevető táblázat
+```{r}
+results_2 <- expected_all_2
+
+# train adatok
+train_df_2 <- results_2 %>%
+  filter(!excluded) %>%
+  select(date, age_mid, observed = outcome, expected)
+
+# test adatok
+test_df_2 <- results_2 %>%
+  filter(excluded) %>%
+  select(date, age_mid, observed = outcome, expected)
+```
+
+### Hibamérték (MSE, RMSE, MAE)
+```{r}
+# Error metrikák kiszámítása teszt időszakra
+error_metrics_2 <-test_df_2 %>%
+  mutate(error = observed - expected) %>%
+  summarise(
+    MSE = mean(error^2),
+    RMSE = sqrt(mean(error^2)),
+    MAE = mean(abs(error))
+  )
+error_metrics_2
+
+```
+
+```{r}
+error_by_age_2 <- test_df_2 %>%
+  mutate(error = observed - expected) %>%
+  group_by(age_mid) %>%
+  summarise(
+    MSE = mean(error^2),
+    RMSE = sqrt(mean(error^2)),
+    MAE = mean(abs(error))
+  )
+error_by_age_2
+```
+
+
+## 20 év tanítás + 3 év előrejelzés
+
+```{r}
+
+test_end_date_3 <- train_end_date + lubridate::years(3)
+
+test_dates_3 <- all_dates[all_dates >= test_start_date &
+                          all_dates <  test_end_date_3]
+
+expected_all_3 <- compute_expected_2d_mgcv(
+  counts = data_long,
+  exclude = test_dates_3,
+  age_var = "age_mid",
+  k_time = 20,
+  k_age = 10,
+  k_season = 10,
+  weekday.effect = FALSE
+)
+
+```
+
+### TRAIN- TEST összevető táblázat
+```{r}
+results_3 <- expected_all_3
+
+# train adatok
+train_df_3 <- results_3 %>%
+  filter(!excluded) %>%
+  select(date, age_mid, observed = outcome, expected)
+
+# test adatok
+test_df_3 <- results_3 %>%
+  filter(excluded) %>%
+  select(date, age_mid, observed = outcome, expected)
+```
+
+### Hibamérték (MSE, RMSE, MAE)
+```{r}
+# Error metrikák kiszámítása teszt időszakra
+error_metrics_3 <-test_df_3 %>%
+  mutate(error = observed - expected) %>%
+  summarise(
+    MSE = mean(error^2),
+    RMSE = sqrt(mean(error^2)),
+    MAE = mean(abs(error))
+  )
+error_metrics_3
+
+```
+
+```{r}
+error_by_age_3 <- test_df_3 %>%
+  mutate(error = observed - expected) %>%
+  group_by(age_mid) %>%
+  summarise(
+    MSE = mean(error^2),
+    RMSE = sqrt(mean(error^2)),
+    MAE = mean(abs(error))
+  )
+error_by_age_3
+```
+
+
